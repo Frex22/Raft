@@ -20,6 +20,7 @@ package raft
 import "sync"
 import "sync/atomic"
 import "labrpc"
+import "time"
 
 // import "bytes"
 // import "labgob"
@@ -45,6 +46,10 @@ type ApplyMsg struct {
 
 //
 // A Go object implementing a single Raft peer.
+type LogEntry struct {
+	Command interface{}
+	Term int // term when entry was received by leader
+}
 //
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -53,9 +58,25 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
+
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	CurrentTerm int
+	//voted for to be initialized to -1
+	VotedFor   int 	// candidateId that received vote in current term (or null if none)
+	Log         []LogEntry // log entries; each entry contains command for state machine, and term when entry was received by leader
+	CommitIndex int // index of highest log entry known to be committed (initialized to 0, increases monotonically)
+	LastApplied int // index of highest log entry applied to state machine
+	NextIndex  []int // for each server, index of the next log entry to send to that server
+	MatchIndex []int // for each server, index of highest log entry known to be replicated on server
+	State      string // "follower", "candidate", or "leader"
+	ElectionTimeout int // timeout for elections
+	ApplyCh   chan ApplyMsg // channel to send ApplyMsg to service or tester
+	LastHeartbeat time.Time // time of last heartbeat received
+
+
+
 
 }
 
@@ -66,6 +87,11 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	//lock for thread safety
+	rf.mu.Lock()
+	term = rf.CurrentTerm // get the current term
+	isleader = (rf.State == "leader")
+	rf.mu.Unlock()
 	return term, isleader
 }
 
@@ -116,6 +142,11 @@ func (rf *Raft) readPersist(data []byte) {
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
+	Term 	  int    // candidate's term
+	CandidateId int
+	LastlogIndex int // index of candidate's last log entry
+	LastlogTerm  int // term of candidate's last log entry
+	// What else does a candidate need to send when asking for votes
 	// Your data here (2A, 2B).
 }
 
@@ -124,6 +155,20 @@ type RequestVoteArgs struct {
 // field names must start with capital letters!
 //
 type RequestVoteReply struct {
+	Term int
+	VoteGranted bool
+	// What does a server reply with when receiving a vote request?
+	// It should include the current term and whether it granted the vote.
+	// If the term in the request is less than the server's current term,
+	// the server should not grant the vote and should return false.
+	// If the term in the request is greater than or equal to the server's
+	// current term, the server should grant the vote and update its term.
+	// If the server is not a candidate, it should return false.
+	// If the server is a candidate and the request is valid, it should
+	// grant the vote and return true.
+	// Make sure to handle the case where the server's term is updated
+	// while processing the request.
+	// This can happen if the server receives a heartbeat from a leader
 	// Your data here (2A).
 }
 
@@ -131,11 +176,54 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	
+	// Default reply values
+	reply.Term = rf.CurrentTerm
+	reply.VoteGranted = false
+	
+	// Rule 1: Reply false if term < currentTerm
+	if args.Term < rf.CurrentTerm {
+		return
+	}
+	
+	// Rule 2: If args.Term > currentTerm, update term and become follower
+	if args.Term > rf.CurrentTerm {
+		rf.CurrentTerm = args.Term
+		rf.VotedFor = -1  // Reset vote for new term
+		rf.State = "follower"
+		rf.persist()
+	}
+	
+	// Update reply term after potential update
+	reply.Term = rf.CurrentTerm
+	
+	// Rule 3: Check if we can vote for this candidate
+	canVote := (rf.VotedFor == -1 || rf.VotedFor == args.CandidateId)
+	
+	// Rule 4: Check if candidate's log is at least as up-to-date as ours
+	lastLogIndex := len(rf.Log) - 1
+	lastLogTerm := 0
+	if lastLogIndex >= 0 {
+		lastLogTerm = rf.Log[lastLogIndex].Term
+	}
+	
+	logUpToDate := (args.LastlogTerm > lastLogTerm) || 
+					(args.LastlogTerm == lastLogTerm && args.LastlogIndex >= lastLogIndex)
+	
+	// Grant vote if both conditions are met
+	if canVote && logUpToDate {
+		rf.VotedFor = args.CandidateId
+		rf.LastHeartbeat = time.Now()
+		reply.VoteGranted = true
+		rf.persist()
+	}
 }
 
 //
 // example code to send a RequestVote RPC to a server.
+
 // server is the index of the target server in rf.peers[].
 // expects RPC arguments in args.
 // fills in *reply with RPC reply, so caller should
@@ -234,6 +322,22 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.CurrentTerm = 0
+	rf.VotedFor = -1
+	rf.Log = []LogEntry{}
+	rf.CommitIndex = 0
+	//liast of varibles I think this should have
+	//last applied, nextIndex, matchindex, state, election timeout:yes/no, channel for apply messages, last heartbeat time
+	//as the paper says, everyone is a follower at the start
+	rf.LastApplied = 0
+	rf.State = "follower"
+	rf.ApplyCh = applyCh
+	rf.ElectionTimeout = 150 + me*10 // stagger election timeouts to avoid
+	// simultaneous elections. 150ms is a good base value.
+	rf.NextIndex = make([]int, len(peers))
+	rf.MatchIndex = make([]int, len(peers))
+	rf.LastHeartbeat = time.Now()
+
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
